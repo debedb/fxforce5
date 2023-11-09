@@ -9,3 +9,13 @@ Walk through the code and for constructors named `NewX()` returning `X`:
 Rewrite 
 
 1. Constructors are named as `NewX`
+
+For why redundancy see https://github.com/uber-go/fx/discussions/1110
+
+## Known issues
+
+ * Free-floating comments are messed up (See https://github.com/golang/go/issues/20744)
+
+## See also
+
+ * https://github.com/uber-go/fx/discussions/1110

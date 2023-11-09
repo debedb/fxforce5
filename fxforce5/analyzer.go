@@ -1,8 +1,3 @@
-// Based on Pani Networks
-// https://github.com/romana/core/tree/42682d9f8d6151ed7175528dbc4194e77744716f/tools
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-
 package fxforce5
 
 import (
@@ -10,7 +5,6 @@ import (
 	"fmt"
 	"go/printer"
 	"go/types"
-	"regexp"
 	"strings"
 
 	"golang.org/x/mod/modfile"
@@ -32,12 +26,25 @@ import (
 	"path/filepath"
 )
 
+const (
+	UBER_FX_IMPORT = "\"go.uber.org/fx\""
+	DIUTILS_IMPORT = "\"github.com/debedb/fxforce5/diutils\""
+
+	// Whether to import diutils module as local to the
+	// analyzed project (true) or from DIUTILS_IMPORT (false)
+	// TODO should be configurable on CLI
+	DIUTILS_LOCAL = true
+)
+
 // Analyzer uses various reflection/introspection/code analysis methods to analyze
 // code and store metadata about it, for various purposes. It works on a level of
 // a Go "repository" (see https://golang.org/doc/code.html#Organization).
 type Analyzer struct {
 	// Path started with.
 	path string
+
+	// List of files to ignore.
+	ignores []string
 
 	// In Go convention, this is "src" directory under path (above). Saved
 	// here to avoid doing path + "/src" all the time.s
@@ -64,7 +71,7 @@ type Analyzer struct {
 
 // NewAnalyzer creates a new Analyzer object for analysis of Go project
 // in the provided path.
-func NewAnalyzer(path string) *Analyzer {
+func NewAnalyzer(path string, ignores []string) *Analyzer {
 	// Hm do we need conf?
 	conf := packages.Config{Mode: packages.NeedName | packages.NeedFiles | packages.NeedDeps | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedModule,
 		Dir: path}
@@ -79,8 +86,6 @@ func NewAnalyzer(path string) *Analyzer {
 	}
 	return a
 }
-
-var pathVariableRegexp regexp.Regexp
 
 func (a *Analyzer) Analyze() error {
 	f, err := os.Open(a.srcDir)
@@ -113,33 +118,6 @@ func (a *Analyzer) Analyze() error {
 	}
 	log.Printf("Visited:\n%s", a.analyzed)
 
-	// lprog, err := a.conf.Load()
-	// if lprog == nil {
-	// 	return err
-	// }
-	// log.Printf("Loaded program: %v, Error: %T %v", lprog, err, err)
-
-	// for _, pkg := range lprog.InitialPackages() {
-	// 	for k, v := range pkg.Types {
-	// 		log.Printf("%v ==> %+v", k, v)
-	// 	}
-
-	// 	scope := pkg.Pkg.Scope()
-	// 	for _, n := range scope.Names() {
-	// 		obj := scope.Lookup(n)
-	// 		log.Printf("Type: Type: %s: %s ", obj.Type().String(), obj.Id())
-	// 		a.objects = append(a.objects, obj)
-	// 	}
-	// }
-
-	// ssaProg := ssautil.CreateProgram(lprog, ssa.BuilderMode(ssa.GlobalDebug))
-	// ssaProg.Build()
-
-	// for _, p := range a.docPackages {
-	// 	for _, t := range p.Types {
-	// 		log.Printf("\n****\n%+v\n****\n", t)
-	// 	}
-	// }
 	return nil
 }
 
@@ -164,7 +142,6 @@ func (a *Analyzer) walker(path string, info os.FileInfo, err error) error {
 		log.Printf("Ignoring (visited): %s in %+v", path, a.analyzed)
 		return nil
 	}
-	a.analyzed = append(a.analyzed, path)
 	if err != nil {
 		log.Printf("Error in walking %s: %s", path, err)
 		return err
@@ -176,79 +153,122 @@ func (a *Analyzer) walker(path string, info os.FileInfo, err error) error {
 
 	if strings.HasSuffix(name, ".go") {
 		a.analyzeFile(path)
+		// Really don't need this
+		a.analyzed = append(a.analyzed, path)
 	}
-
-	// if info.IsDir() {
-	// 	err = a.analyzePath(path)
-	// 	if err != nil {
-	// 		log.Printf("Error in analyzePath(%s): %s", path, err)
-	// 		return filepath.SkipDir
-	// 	}
-	// }
 
 	return nil
 }
 
 type analyzedFile struct {
-	path         string
-	topNode      *ast.File
-	structTypes  []*ast.TypeSpec
-	constructors []*ast.FuncDecl
-	imports      []*ast.ImportSpec
+	path    string
+	relPath string
+
+	diutilsImportPath string
+
+	topNode     *ast.File
+	structTypes []*ast.TypeSpec
+
+	// Map of identifier of return type to constructor function
+	constructors map[string]*ast.FuncDecl
+
+	// Map of identifier of struct types returned by constructors to
+	// the declarations of corresponding fx params structs
+	paramStruct map[string]*ast.TypeSpec
+
+	imports []*ast.ImportSpec
 }
 
-func (af *analyzedFile) applyPost(c *astutil.Cursor) bool {
+// Noop because we only use this in post-processing step anyway
+func (af *analyzedFile) postProcessApplyPost(c *astutil.Cursor) bool {
 	return true
 }
 
-func (af *analyzedFile) applyPre(c *astutil.Cursor) bool {
+// This is used to better structure changes in the post-processing step
+func (af *analyzedFile) postProcessApplyPre(c *astutil.Cursor) bool {
 	n := c.Node()
+	switch nType := n.(type) {
+	case *ast.TypeSpec:
+		if nType.Type.(*ast.StructType) == nil {
+			break
+		}
+		paramStructDecl := af.paramStruct[nType.Name.Name]
+		if paramStructDecl == nil {
+			log.Printf("No param struct for %s\n", nType.Name.Name)
+			break
+		}
+		log.Printf("Inserting %s after %s\n", paramStructDecl.Name.Name, nType.Name.Name)
+
+		c.InsertAfter(paramStructDecl)
+	}
+	return true
+}
+
+func (af *analyzedFile) inspect(n ast.Node) bool {
 	switch nType := n.(type) {
 	case *ast.ImportSpec:
 		af.imports = append(af.imports, nType)
+
 	case *ast.TypeSpec:
 		if nType.Type.(*ast.StructType) != nil {
 			log.Printf("Found struct: %+v", nType.Name.Name)
 			af.structTypes = append(af.structTypes, nType)
 		}
 
-	// case *ast.StructType:
-	// 	log.Printf("Found struct: %+v", nType.Struct
 	case *ast.FuncDecl:
 		if strings.HasPrefix(nType.Name.Name, "New") {
 			log.Printf("Found constructor: %+v", nType.Name.Name)
-			af.constructors = append(af.constructors, nType)
+			results := nType.Type.Results
+			if results.NumFields() != 1 {
+				log.Printf("Constructor %s has %d results, expected 1", nType.Name.Name, results.NumFields())
+				return true
+			}
+			resType := results.List[0].Type
+			log.Printf("Result type: %+v", resType)
+			resTypeKey := *&resType.(*ast.Ident).Name
+			if af.constructors == nil {
+				af.constructors = make(map[string]*ast.FuncDecl)
+			}
+			if af.constructors[resTypeKey] != nil {
+				log.Printf("Constructor for %s already exists: %+v\n", resType, af.constructors[resTypeKey])
+				return true
+			}
+			af.constructors[resTypeKey] = nType
 			for i, param := range nType.Type.Params.List {
 				log.Printf("\tParam %d: %+v", i, param)
 			}
 		}
+
+	case *ast.GenDecl:
+		// Look for var declarations having fx.Module -- to skip calling
+		// addFxModule if so
+		if nType.Tok != token.VAR {
+			return true
+		}
+		// TODO
+
 	}
 	return true
 }
 
-const UBER_FX_IMPORT = "\"go.uber.org/fx\""
-
-func (af *analyzedFile) postProcess() {
-	// 1. Add imports
-	fxFound := false
-	for _, imp := range af.imports {
-		if imp.Path.Value == UBER_FX_IMPORT {
-			fxFound = true
-			break
-		}
+// 2. Add module decl, like so:
+//
+//	var DependenciesModule = fx.Module("apiDependencies",
+//	fx.Provide(NewRoutes),
+//	fx.Provide(handlers.NewFileHandler),
+//
+// )
+func (af *analyzedFile) addFxModule() {
+	// Figure out name of fx module
+	fxModName := strings.Split(af.relPath, ".")[0]
+	fxModParts := strings.Split(fxModName, "/")
+	fxModName = ""
+	for _, part := range fxModParts {
+		fxModName += strings.ToUpper(part[0:1]) + part[1:]
 	}
-	if !fxFound {
-		af.topNode.Imports = append(af.topNode.Imports, &ast.ImportSpec{Path: &ast.BasicLit{Value: UBER_FX_IMPORT}})
-	}
+	fxModNameQuoted := "\"" + fxModName + "\""
 
-	// 2. Add module decl, like so:
-
-	// 	var DependenciesModule = fx.Module("apiDependencies",
-	// 	fx.Provide(NewRoutes),
-	// 	fx.Provide(handlers.NewFileHandler),
-	// )
-
-	fxModuleArgs := []ast.Expr{&ast.BasicLit{Value: "TODOModule"}}
+	fxModuleArgs := []ast.Expr{&ast.BasicLit{Value: fxModNameQuoted}}
 
 	for _, constructor := range af.constructors {
 		providerCall := &ast.CallExpr{
@@ -263,12 +283,93 @@ func (af *analyzedFile) postProcess() {
 		Fun:  &ast.SelectorExpr{X: &ast.Ident{Name: "fx"}, Sel: &ast.Ident{Name: "Module"}},
 		Args: fxModuleArgs}
 
-	af.topNode.Decls = append(af.topNode.Decls, &ast.GenDecl{Tok: token.VAR,
+	fxModuleVarDecl := &ast.GenDecl{Tok: token.VAR,
 		Specs: []ast.Spec{&ast.ValueSpec{
-			Names:  []*ast.Ident{&ast.Ident{Name: "TODOModule"}},
-			Values: []ast.Expr{fxModuleCall}}}})
+			Names:  []*ast.Ident{{Name: fxModName}},
+			Values: []ast.Expr{fxModuleCall}}}}
+	// Put it on top
+	af.topNode.Decls = append([]ast.Decl{fxModuleVarDecl}, af.topNode.Decls...)
+}
 
-	// 3. Rewrite constructors
+func (af *analyzedFile) addImports() {
+	fxFound := false
+	diutilsFound := false
+	for _, imp := range af.imports {
+		if imp.Path.Value == UBER_FX_IMPORT {
+			fxFound = true
+		}
+		if imp.Path.Value == af.diutilsImportPath {
+			diutilsFound = true
+		}
+		if fxFound && diutilsFound {
+			break
+		}
+	}
+	if !fxFound {
+		af.topNode.Imports = append(af.topNode.Imports, &ast.ImportSpec{Path: &ast.BasicLit{Value: UBER_FX_IMPORT}})
+	}
+	if !diutilsFound {
+		af.topNode.Imports = append(af.topNode.Imports,
+			&ast.ImportSpec{Path: &ast.BasicLit{
+				Value: "\"" + af.diutilsImportPath + "\""}})
+	}
+}
+
+// Prepare param struct declarations for all structs that have constructors.
+// This is done in a separate pass because we need to know all the constructors.
+// We will then pass it to the astutil.Apply() function to do the actual
+// insertion of those just so they can be inserted after the struct declaration
+// Fields have to be copied from the original struct, but fx.In has to be added
+// Unfortunately, merely embedding the original struct does not work.
+// See also https://github.com/uber-go/fx/discussions/1110
+func (af *analyzedFile) prepareParamStructs() {
+	if af.paramStruct == nil {
+		af.paramStruct = make(map[string]*ast.TypeSpec)
+	}
+
+	for _, structType := range af.structTypes {
+		if af.constructors[structType.Name.Name] == nil {
+			log.Printf("Ignoring struct %s as it does not have a constructor", structType.Name.Name)
+			continue
+		}
+
+		paramStructFields := &ast.FieldList{
+			List: make([]*ast.Field, 0),
+		}
+
+		// Add fx.In as first field
+		paramStructFields.List = append(paramStructFields.List, &ast.Field{
+			Type: &ast.Ident{Name: "fx.In"},
+		})
+
+		for _, field := range structType.Type.(*ast.StructType).Fields.List {
+			paramStructFields.List = append(paramStructFields.List, field)
+		}
+
+		paramStruct := &ast.StructType{
+			Fields: paramStructFields,
+		}
+		paramTypeSpec := &ast.TypeSpec{
+			Name: &ast.Ident{Name: structType.Name.Name + "Params"},
+			Type: paramStruct,
+		}
+		// paramTypeDecl := &ast.GenDecl{
+		// 	Tok:   token.TYPE,
+		// 	Specs: []ast.Spec{paramTypeSpec},
+		// }
+
+		af.paramStruct[structType.Name.Name] = paramTypeSpec
+
+	}
+}
+
+func (af *analyzedFile) postProcess() {
+	af.addImports()
+
+	af.addFxModule()
+	af.prepareParamStructs()
+
+	astutil.Apply(af.topNode, af.postProcessApplyPre, af.postProcessApplyPost)
 }
 
 func (af *analyzedFile) write() error {
@@ -276,7 +377,7 @@ func (af *analyzedFile) write() error {
 	newPath := strings.Split(af.path, ".")[0] + "_new.go"
 	fset.AddFile(newPath, fset.Base(), 0)
 
-	outFile, err := os.Open(newPath)
+	outFile, err := os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
@@ -284,7 +385,9 @@ func (af *analyzedFile) write() error {
 	if err != nil {
 		return err
 	}
+	outFile.Close()
 	fmt.Printf("Wrote %s\n", newPath)
+
 	return nil
 }
 
@@ -295,123 +398,21 @@ func (a *Analyzer) analyzeFile(path string) error {
 	if err != nil {
 		return err
 	}
-	af := &analyzedFile{path: path, topNode: node}
-	// ast.Inspect(node, af.inspect)
-	astutil.Apply(node, af.applyPre, af.applyPost)
+	diutilsImportPath := DIUTILS_IMPORT
+	if DIUTILS_LOCAL {
+		diutilsImportPath = a.modPath + "/diutils"
+	}
+	af := &analyzedFile{
+		path:              path,
+		diutilsImportPath: diutilsImportPath,
+		relPath:           path[len(a.path+"/src/"):],
+		topNode:           node}
+
+	// This is done in several passes. We use Inspect at the first pass because we cannot
+	// do any changes until we collect all the information. Then we use Apply to do the
+	// changes.
+	ast.Inspect(node, af.inspect)
 	af.postProcess()
 	err = af.write()
 	return err
-}
-
-func (a *Analyzer) analyzePath(path string) error {
-
-	importPath := path[len(a.path+"/src/"):]
-	if importPath == "" {
-		return nil
-	}
-	importPath = a.modPath + "/" + importPath
-	a.importPaths = append(a.importPaths, importPath)
-
-	// bpkg -- build packages
-	bpkg, err := build.Import(importPath, "", 0)
-	// If no Go files are found, we can skip it - not a real error.
-	_, nogo := err.(*build.NoGoError)
-	if err != nil {
-		if !nogo {
-			log.Printf("Error in build.Import(\"%s\"): %+v %T", path, err, err)
-			return err
-		}
-		log.Printf("%s", err)
-		return nil
-	}
-	//log.Printf("build.Import(%s, \"\", 0) = %+v", path, bpkg)
-
-	files := make(map[string]*ast.File)
-	goFiles := bpkg.GoFiles
-	cGoFiles := bpkg.CgoFiles
-	for _, name := range append(goFiles, cGoFiles...) {
-		goFileName := filepath.Join(bpkg.Dir, name)
-		// log.Printf("Processing %s...", goFileName)
-		file, err := parser.ParseFile(a.fileSet, goFileName, nil, parser.ParseComments)
-		a.astFiles = append(a.astFiles, file)
-		// TODO do we need to do anything with file.Scope?
-		//		log.Printf("Processed %s: (%+v, %s)", goFileName, file, err)
-		if err != nil {
-			return err
-		}
-		files[name] = file
-	}
-
-	//	typeConfig := &types.Config{}
-	//	info := &types.Info{}
-	//	tpkg, err := typeConfig.Check(importPath, a.fileSet, a.astFiles, info)
-	//	log.Printf("Types package info: %+v", info)
-
-	// apkg - ast packages
-	apkg := &ast.Package{Name: bpkg.Name, Files: files}
-	// dpkg - doc packages
-	dpkg := doc.New(apkg, bpkg.ImportPath, doc.AllDecls|doc.AllMethods)
-
-	log.Printf("In AST package %s, Doc package %s, Build package %s", apkg.Name, dpkg.Name, bpkg.Name)
-
-	for _, t := range dpkg.Types {
-		// fullName is full import path (github.com/romana/core/tenant) DOT name of type
-		fullName := fmt.Sprintf("%s.%s", importPath, t.Name)
-		a.fullTypeDocs[fullName] = t.Doc
-		// shortName is just package.type
-		shortName := fmt.Sprintf("%s.%s", dpkg.Name, t.Name)
-		a.shortTypeDocs[shortName] = t.Doc
-		log.Printf("\tType docs for %s (%s): %+v,", fullName, shortName, t.Doc)
-		for _, m := range t.Methods {
-			methodFullName := fmt.Sprintf("%s.%s", fullName, m.Name)
-			a.fullTypeDocs[methodFullName] = m.Doc
-			methodShortName := fmt.Sprintf("%s.%s", shortName, m.Name)
-			a.shortTypeDocs[methodShortName] = m.Doc
-			log.Printf("\tMethod docs for %s (%s): %+v", methodFullName, methodShortName, m.Doc)
-		}
-	}
-
-	if apkg.Scope != nil && apkg.Scope.Objects != nil {
-		for name, astObj := range apkg.Scope.Objects {
-			log.Printf("AST Object %s.%s: %v", apkg.Name, name, astObj.Data)
-		}
-	}
-
-	//	a.buildPackages = append(a.buildPackages, *bpkg)
-	//	a.astPackages = append(a.astPackages, *apkg)
-	a.docPackages = append(a.docPackages, *dpkg)
-	//	log.Printf("Parsed %s:\nbuildPackage:\n\t%s\nastPackage\n\t%s\ndocPackage:\n\n%s", path, bpkg.Name, apkg.Name, dpkg.Name)
-
-	// a.conf.Import(importPath)
-	return nil
-}
-
-func (a *Analyzer) FindImplementors(interfaceName string) []types.Type {
-	ifc := a.getInterface(interfaceName)
-	implementors := a.getImplementors(ifc)
-	return implementors
-}
-
-func (a *Analyzer) getImplementors(ifc *types.Interface) []types.Type {
-	retval := make([]types.Type, 0)
-	for _, o := range a.objects {
-		log.Printf("\t\tChecking if %s implements %s", o.Type(), ifc)
-		fnc, wrongType := types.MissingMethod(o.Type(), ifc, true)
-		if fnc == nil {
-			retval = append(retval, o.Type())
-			continue
-		} else {
-			log.Printf("%T (%v) does not implement %s: missing %s, wrong type: %t", o, o, ifc, fnc, wrongType)
-		}
-	}
-	return retval
-}
-
-func (a *Analyzer) getInterface(name string) *types.Interface {
-	for _, o := range a.objects {
-		if o.Type().String() == name {
-			return o.Type().Underlying().(*types.Interface)
-		}
-	}
-	return nil
 }
