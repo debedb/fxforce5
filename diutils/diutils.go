@@ -31,6 +31,12 @@ func Construct[P any, T any, PT interface{ *T }](params interface{}) PT {
 	return p
 }
 
+func Constructx[P any, T any, PT interface{ *T }](params P) PT {
+	p := PT(new(T))
+	construct0(params, p)
+	return p
+}
+
 func construct0(params interface{}, retval interface{}) {
 	// Check if retval is a pointer
 	rv := reflect.ValueOf(retval)

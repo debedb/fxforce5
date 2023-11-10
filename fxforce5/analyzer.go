@@ -244,17 +244,69 @@ func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
 		// Otherwise, set PROCESSED_DIRECTIVE for next time
 		nType.Decs.Start.Prepend(PROCESSED_DIRECTIVE)
 
+	case *dst.ValueSpec:
+		fmt.Print("ValueSpec: ")
+
 	case *dst.FuncDecl:
 		// Replace constructor now
 		if strings.HasPrefix(nType.Name.Name, "New") {
-			log.Printf("Found constructor: %+v", nType.Name.Name)
-			results := nType.Type.Results
-			// Only one result here; otherwise would be an error on preprocessing.
-			resType := results.List[0].Type
-			log.Printf("Result type: %+v", resType)
-			// resTypeKey := resType.(*dst.Ident).Name
-			nType.Name.Name = nType.Name.Name + "Orig"
+			ctorName := nType.Name.Name
+			log.Printf("Found constructor: %+v", ctorName)
+
+			// Rename original one
+
+			nType.Name.Name = ctorName + "Orig"
 			c.Replace(nType)
+
+			// Only one result here; otherwise would be an error on preprocessing.
+			results := nType.Type.Results.List
+			result := results[0]
+
+			// TODO we could have already saved it from the original parse
+			// Plus we'll need to make distinction between pointer and non-pointer
+			origStructName := result.Type.(*dst.Ident).Name
+			paramStructName := origStructName + "Params"
+
+			arg := &dst.Field{Names: []*dst.Ident{{Name: "params"}},
+				Type: &dst.Ident{Name: paramStructName}}
+			args := []*dst.Field{arg}
+
+			// return diutils.Construct[ServerParams, ServerCfg](p)
+			constructCall := &dst.CallExpr{}
+			constructGenericParams := []dst.Expr{
+				&dst.Ident{Name: origStructName},
+				&dst.Ident{Name: paramStructName},
+			}
+
+			constructCall.Fun = &dst.IndexListExpr{
+				// diutils.Construct
+				X: &dst.SelectorExpr{
+					X:   &dst.Ident{Name: "diutils"},
+					Sel: &dst.Ident{Name: "Construct"},
+				},
+				// Generic type parameters
+				Indices: constructGenericParams,
+			}
+			constructCall.Args = []dst.Expr{&dst.Ident{Name: "params"}}
+
+			retStmt := &dst.ReturnStmt{Results: []dst.Expr{constructCall}}
+			body := &dst.BlockStmt{
+				List: []dst.Stmt{retStmt},
+			}
+
+			newCtor := &dst.FuncDecl{
+				Name: &dst.Ident{Name: ctorName},
+				Type: &dst.FuncType{
+					Func:    true,
+					Params:  &dst.FieldList{List: args},
+					Results: &dst.FieldList{List: results},
+				},
+				Body: body,
+			}
+			log.Printf("Inserting new constructor: %+v", newCtor)
+			// c.InsertBefore(newCtor)
+			// resTypeKey := resType.(*dst.Ident).Name
+
 		}
 
 	case *dst.GenDecl:

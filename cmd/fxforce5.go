@@ -1,7 +1,8 @@
 package main
 
 import (
-	"fmt"
+	"flag"
+	"log"
 
 	"github.com/debedb/fxforce5/fxforce5"
 )
@@ -21,8 +22,13 @@ import (
 
 // TODO command line options
 func main() {
-	fmt.Println("Hello, World!")
-	srcRoot := "/Users/gregory/g/git/catalog-be-go2"
+
+	flag.Parse()
+
+	if len(flag.Args()) != 1 {
+		log.Fatal("For usage: fxforce5 -h")
+	}
+	srcRoot := flag.Args()[0]
 	// TODO add as a pattern, to skip things like /generated/**.go
 	// ignores := []string{"internal/dependencies.go"}
 	analyzer := fxforce5.NewAnalyzer(srcRoot, nil)

@@ -10,6 +10,9 @@
             "request": "launch",
             "mode": "auto",
             "program": "${workspaceFolder}/cmd/fxforce5.go",
+            "args": [
+                "/Users/gregory/g/git/catalog-be-go2"
+            ]
         }
     ]
 }
