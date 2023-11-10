@@ -166,15 +166,21 @@ type analyzedFile struct {
 
 	diutilsImportPath string
 
-	topNode     *ast.File
+	topNode *ast.File
+
+	// Constructed in inspect()
 	structTypes []*ast.TypeSpec
 
-	// Map of identifier of return type to constructor function
+	// Map of identifier of return type to constructor function.
+	// Constructed in inspect()
 	constructors map[string]*ast.FuncDecl
 
 	// Map of identifier of struct types returned by constructors to
 	// the declarations of corresponding fx params structs
+	// Constructed in prepareParamStructs()
 	paramStruct map[string]*ast.TypeSpec
+
+	existingModuleVar string
 
 	imports []*ast.ImportSpec
 }
@@ -188,6 +194,18 @@ func (af *analyzedFile) postProcessApplyPost(c *astutil.Cursor) bool {
 func (af *analyzedFile) postProcessApplyPre(c *astutil.Cursor) bool {
 	n := c.Node()
 	switch nType := n.(type) {
+	case *ast.GenDecl:
+
+		// Add fx.Module declaration if needed, after imports
+		if nType.Tok == token.IMPORT {
+			if af.existingModuleVar != "" {
+				log.Printf("Skipping adding fx.Module declaration to %s -- already exists as %+v\n", af.relPath, af.existingModuleVar)
+				break
+			}
+			decl := af.getFxModuleDecl()
+			c.InsertAfter(decl)
+		}
+	// Add params struct
 	case *ast.TypeSpec:
 		if nType.Type.(*ast.StructType) == nil {
 			break
@@ -198,12 +216,15 @@ func (af *analyzedFile) postProcessApplyPre(c *astutil.Cursor) bool {
 			break
 		}
 		log.Printf("Inserting %s after %s\n", paramStructDecl.Name.Name, nType.Name.Name)
-
+		// TODO this would group all the type decls together. It can be done separately
+		// similar to how it is done for the fx.Module declaration
 		c.InsertAfter(paramStructDecl)
 	}
 	return true
 }
 
+// First pass -- analyze the file and collect information about it.
+// No changes to the AST are made here.
 func (af *analyzedFile) inspect(n ast.Node) bool {
 	switch nType := n.(type) {
 	case *ast.ImportSpec:
@@ -245,20 +266,37 @@ func (af *analyzedFile) inspect(n ast.Node) bool {
 		if nType.Tok != token.VAR {
 			return true
 		}
-		// TODO
-
+		// This is a lot of nested ifs, sigh.
+		for _, spec := range nType.Specs {
+			if valSpec, ok := spec.(*ast.ValueSpec); ok {
+				for valSpecIdx, expr := range valSpec.Values {
+					if callExpr, ok := expr.(*ast.CallExpr); ok {
+						if selExpr, ok := callExpr.Fun.(*ast.SelectorExpr); ok {
+							if xExpr, ok := selExpr.X.(*ast.Ident); ok {
+								if xExpr.Name == "fx" && selExpr.Sel.Name == "Module" {
+									af.existingModuleVar = valSpec.Names[valSpecIdx].Name
+									return true
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 	return true
 }
 
-// 2. Add module decl, like so:
+//	 Get the fx module declaration for this file. It will look like this:
 //
-//	var DependenciesModule = fx.Module("apiDependencies",
-//	fx.Provide(NewRoutes),
-//	fx.Provide(handlers.NewFileHandler),
+//		var DependenciesModule = fx.Module("apiDependencies",
+//		fx.Provide(NewRoutes),
+//		fx.Provide(handlers.NewFileHandler),
+//
+//	 We'll call it in the Apply to add right after the imports clause
 //
 // )
-func (af *analyzedFile) addFxModule() {
+func (af *analyzedFile) getFxModuleDecl() *ast.GenDecl {
 	// Figure out name of fx module
 	fxModName := strings.Split(af.relPath, ".")[0]
 	fxModParts := strings.Split(fxModName, "/")
@@ -283,12 +321,16 @@ func (af *analyzedFile) addFxModule() {
 		Fun:  &ast.SelectorExpr{X: &ast.Ident{Name: "fx"}, Sel: &ast.Ident{Name: "Module"}},
 		Args: fxModuleArgs}
 
-	fxModuleVarDecl := &ast.GenDecl{Tok: token.VAR,
-		Specs: []ast.Spec{&ast.ValueSpec{
-			Names:  []*ast.Ident{{Name: fxModName}},
-			Values: []ast.Expr{fxModuleCall}}}}
-	// Put it on top
-	af.topNode.Decls = append([]ast.Decl{fxModuleVarDecl}, af.topNode.Decls...)
+	fxModuleVarDecl := &ast.GenDecl{
+		Tok: token.VAR,
+		Specs: []ast.Spec{
+			&ast.ValueSpec{
+				Names:  []*ast.Ident{{Name: fxModName}},
+				Values: []ast.Expr{fxModuleCall},
+			},
+		},
+	}
+	return fxModuleVarDecl
 }
 
 func (af *analyzedFile) addImports() {
@@ -364,12 +406,14 @@ func (af *analyzedFile) prepareParamStructs() {
 }
 
 func (af *analyzedFile) postProcess() {
+	if af.constructors == nil || len(af.constructors) == 0 {
+		log.Printf("Skipping post-processing for %s -- no constructors\n", af.relPath)
+		return
+	}
 	af.addImports()
-
-	af.addFxModule()
 	af.prepareParamStructs()
-
 	astutil.Apply(af.topNode, af.postProcessApplyPre, af.postProcessApplyPost)
+
 }
 
 func (af *analyzedFile) write() error {
