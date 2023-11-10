@@ -3,10 +3,12 @@ package fxforce5
 import (
 	"errors"
 	"fmt"
-	"go/printer"
 	"go/types"
 	"strings"
 
+	"github.com/dave/dst"
+	"github.com/dave/dst/decorator"
+	"github.com/dave/dst/dstutil"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
@@ -32,7 +34,8 @@ const (
 
 	// Whether to import diutils module as local to the
 	// analyzed project (true) or from DIUTILS_IMPORT (false)
-	// TODO should be configurable on CLI
+	// TODO should be configurable on CLI -- but the import from
+	// this package would require modifying go.mod of the target.
 	DIUTILS_LOCAL = true
 
 	// Processed directive to ignore a file
@@ -172,6 +175,8 @@ type analyzedFile struct {
 
 	topNode *ast.File
 
+	topDstNode *dst.File
+
 	// Constructed in inspect()
 	structTypes []*ast.TypeSpec
 
@@ -184,18 +189,101 @@ type analyzedFile struct {
 	// Constructed in prepareParamStructs()
 	paramStruct map[string]*ast.TypeSpec
 
+	// If true, this file has already been processed.
+	// This will be detected by the presence of PROCESSED_DIRECTIVE.
+	// This is detected by applyPreDst() (not by inspect() which detects
+	// everything in the first pass because for some reason the ast handling
+	// of comments even on read is flaky. We want to detect this directive
+	// in the top of the file.
+	alreadyProcessed bool
+
+	hasUberFxImport  bool
+	hasDiUtilsImport bool
+
 	existingModuleVar string
+
+	// Because walker (apply{Pre,Post} or Inspect) functions cannot return an error
+	// we'll store it here and return it after the walking.
+	err error
 
 	imports []*ast.ImportSpec
 }
 
 // Noop because we only use this in post-processing step anyway
-func (af *analyzedFile) postProcessApplyPost(c *astutil.Cursor) bool {
+// func (af *analyzedFile) applyPost(c *astutil.Cursor) bool {
+// 	return true
+// }
+
+func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
+	n := c.Node()
+	switch nType := n.(type) {
+
+	case *dst.ImportSpec:
+		if !af.hasUberFxImport {
+			c.InsertBefore(&dst.ImportSpec{Path: &dst.BasicLit{Value: UBER_FX_IMPORT}})
+			af.hasUberFxImport = true
+		}
+		if !af.hasDiUtilsImport {
+			c.InsertBefore(&dst.ImportSpec{Path: &dst.BasicLit{
+				Value: "\"" + af.diutilsImportPath + "\""}})
+			af.hasDiUtilsImport = true
+		}
+
+	case *dst.File:
+		// Detect if processed, if so, set flag and return false
+		beforeDecs := nType.Decs.Start.All()
+		for _, s := range beforeDecs {
+			if s == PROCESSED_DIRECTIVE {
+				af.alreadyProcessed = true
+				return false
+			}
+		}
+		// Otherwise, set processed for next time
+		nType.Decs.Start.Prepend(PROCESSED_DIRECTIVE)
+
+	case *dst.GenDecl:
+		// Add fx.Module declaration if needed, after imports
+		if nType.Tok == token.IMPORT {
+			if af.existingModuleVar != "" {
+				log.Printf("Skipping adding fx.Module declaration to %s -- already exists as %+v\n", af.relPath, af.existingModuleVar)
+				break
+			}
+			decl := af.getFxModuleDecl()
+			dstDecl, err := decorator.NewDecorator(nil).DecorateNode(decl)
+			if err != nil {
+				af.err = err
+				return false
+			}
+			c.InsertAfter(dstDecl)
+		}
+
+	// Add params struct
+	case *dst.TypeSpec:
+		if nType.Type.(*dst.StructType) == nil {
+			break
+		}
+		origStructName := nType.Name.Name
+		paramStructDecl := af.paramStruct[origStructName]
+		if paramStructDecl == nil {
+			log.Printf("No param struct for %s\n", origStructName)
+			break
+		}
+		log.Printf("Inserting %s after %s\n", paramStructDecl.Name.Name, nType.Name.Name)
+		// TODO this would group all the type decls together. It can be done separately
+		// similar to how it is done for the fx.Module declaration
+
+		dstParamStructDecl, err := decorator.NewDecorator(nil).DecorateNode(paramStructDecl)
+		if err != nil {
+			af.err = err
+			return false
+		}
+		c.InsertAfter(dstParamStructDecl)
+	}
 	return true
 }
 
 // This is used to better structure changes in the post-processing step
-func (af *analyzedFile) postProcessApplyPre(c *astutil.Cursor) bool {
+func (af *analyzedFile) applyPre(c *astutil.Cursor) bool {
 	n := c.Node()
 	switch nType := n.(type) {
 	case *ast.GenDecl:
@@ -229,18 +317,17 @@ func (af *analyzedFile) postProcessApplyPre(c *astutil.Cursor) bool {
 
 // First pass -- analyze the file and collect information about it.
 // No changes to the AST are made here.
+// TODO make it a pass also using dst
 func (af *analyzedFile) inspect(n ast.Node) bool {
 	switch nType := n.(type) {
 
-	// TODO handle comments
-	case *ast.CommentGroup:
-		fmt.Printf("CommentGroup detected TODO")
-	case *ast.Comment:
-		fmt.Printf("Comment detected TODO")
-
 	case *ast.ImportSpec:
-		// Collect imports to add missing if needed
-		af.imports = append(af.imports, nType)
+		if nType.Path.Value == UBER_FX_IMPORT {
+			af.hasUberFxImport = true
+		}
+		if nType.Path.Value == af.diutilsImportPath {
+			af.hasDiUtilsImport = true
+		}
 
 	case *ast.TypeSpec:
 		if nType.Type.(*ast.StructType) != nil {
@@ -345,30 +432,6 @@ func (af *analyzedFile) getFxModuleDecl() *ast.GenDecl {
 	return fxModuleVarDecl
 }
 
-func (af *analyzedFile) addImports() {
-	fxFound := false
-	diutilsFound := false
-	for _, imp := range af.imports {
-		if imp.Path.Value == UBER_FX_IMPORT {
-			fxFound = true
-		}
-		if imp.Path.Value == af.diutilsImportPath {
-			diutilsFound = true
-		}
-		if fxFound && diutilsFound {
-			break
-		}
-	}
-	if !fxFound {
-		af.topNode.Imports = append(af.topNode.Imports, &ast.ImportSpec{Path: &ast.BasicLit{Value: UBER_FX_IMPORT}})
-	}
-	if !diutilsFound {
-		af.topNode.Imports = append(af.topNode.Imports,
-			&ast.ImportSpec{Path: &ast.BasicLit{
-				Value: "\"" + af.diutilsImportPath + "\""}})
-	}
-}
-
 // Prepare param struct declarations for all structs that have constructors.
 // This is done in a separate pass because we need to know all the constructors.
 // We will then pass it to the astutil.Apply() function to do the actual
@@ -378,6 +441,8 @@ func (af *analyzedFile) addImports() {
 // See also https://github.com/uber-go/fx/discussions/1110
 func (af *analyzedFile) prepareParamStructs() {
 	if af.paramStruct == nil {
+		// TODO still use ast.TypeSpec because dst.TypeSpec has some issues,
+		// so for now it's a mix of ast and dst
 		af.paramStruct = make(map[string]*ast.TypeSpec)
 	}
 
@@ -418,35 +483,30 @@ func (af *analyzedFile) prepareParamStructs() {
 }
 
 // Return true if there were any changes to the file.
-func (af *analyzedFile) process() bool {
-	alreadyProcessed := false
-	for _, c := range af.topNode.Comments {
-		for _, comment := range c.List {
-			if comment.Text == PROCESSED_DIRECTIVE {
-				alreadyProcessed = true
-				break
-			}
-		}
-	}
-
-	if alreadyProcessed {
-		log.Printf("Skipping post-processing for %s -- already processed\n", af.relPath)
-		return false
-	}
+func (af *analyzedFile) process() (bool, error) {
 
 	if af.constructors == nil || len(af.constructors) == 0 {
 		log.Printf("Skipping post-processing for %s -- no constructors\n", af.relPath)
-		return false
+		return false, nil
 	}
-	af.addImports()
-	af.prepareParamStructs()
-	astutil.Apply(af.topNode, af.postProcessApplyPre, af.postProcessApplyPost)
 
-	// Add processed directive
-	processedComment := &ast.Comment{Text: PROCESSED_DIRECTIVE}
-	af.topNode.Comments = append([]*ast.CommentGroup{{List: []*ast.Comment{processedComment}}},
-		af.topNode.Comments...)
-	return true
+	// astutil.Apply(af.topNode, af.applyPre, af.applyPost)
+	af.prepareParamStructs()
+	dstutil.Apply(af.topDstNode, nil, af.applyPostDst)
+
+	// This will only be detected in the post-processing step for now.
+	// When we replace inspect with dstUtil apply as first pass, this is to be moved up.
+	if af.alreadyProcessed {
+		log.Printf("Skipping post-processing for %s -- already processed\n", af.relPath)
+		return false, nil
+	}
+
+	if af.err != nil {
+		log.Printf("Error in processing %s: %s\n", af.relPath, af.err)
+		return false, af.err
+	}
+
+	return true, nil
 }
 
 func (af *analyzedFile) write() error {
@@ -458,7 +518,11 @@ func (af *analyzedFile) write() error {
 	if err != nil {
 		return err
 	}
-	err = printer.Fprint(outFile, fset, af.topNode)
+
+	// err = printer.Fprint(outFile, fset, af.topNode)
+	restorer := decorator.NewRestorer()
+	err = restorer.FileRestorer().Fprint(outFile, af.topDstNode)
+
 	if err != nil {
 		return err
 	}
@@ -471,10 +535,14 @@ func (af *analyzedFile) write() error {
 func (a *Analyzer) analyzeFile(path string) error {
 	fset := token.NewFileSet()
 	fmt.Printf("Analyzing %s\n", path)
+
 	node, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
 	if err != nil {
 		return err
 	}
+
+	dstNode, err := decorator.NewDecorator(nil).ParseFile(path, nil, parser.ParseComments)
+
 	diutilsImportPath := DIUTILS_IMPORT
 	if DIUTILS_LOCAL {
 		diutilsImportPath = a.modPath + "/diutils"
@@ -483,13 +551,18 @@ func (a *Analyzer) analyzeFile(path string) error {
 		path:              path,
 		diutilsImportPath: diutilsImportPath,
 		relPath:           path[len(a.path+"/src/"):],
-		topNode:           node}
+		topNode:           node,
+		topDstNode:        dstNode}
 
 	// This is done in several passes. We use Inspect at the first pass because we cannot
 	// do any changes until we collect all the information. Then we use Apply to do the
 	// changes.
 	ast.Inspect(node, af.inspect)
-	if !af.process() {
+	processed, err := af.process()
+	if err != nil {
+		return err
+	}
+	if !processed {
 		log.Printf("No changes for %s\n", path)
 		return nil
 	}
