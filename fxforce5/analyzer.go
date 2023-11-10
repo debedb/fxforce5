@@ -294,19 +294,22 @@ func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
 				List: []dst.Stmt{retStmt},
 			}
 
+			ctorResults := &dst.FieldList{
+				List: []*dst.Field{
+					{Type: &dst.Ident{Name: origStructName}},
+				},
+			}
+
 			newCtor := &dst.FuncDecl{
 				Name: &dst.Ident{Name: ctorName},
 				Type: &dst.FuncType{
 					Func:    true,
 					Params:  &dst.FieldList{List: args},
-					Results: &dst.FieldList{List: results},
+					Results: ctorResults,
 				},
 				Body: body,
 			}
-			log.Printf("Inserting new constructor: %+v", newCtor)
-			// c.InsertBefore(newCtor)
-			// resTypeKey := resType.(*dst.Ident).Name
-
+			c.InsertBefore(newCtor)
 		}
 
 	case *dst.GenDecl:
