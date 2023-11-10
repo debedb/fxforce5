@@ -159,7 +159,10 @@ func (a *Analyzer) walker(path string, info os.FileInfo, err error) error {
 	}
 
 	if strings.HasSuffix(name, ".go") {
-		a.analyzeFile(path)
+		err = a.analyzeFile(path)
+		if err != nil {
+			log.Printf("Error in analyzing %s: %s", path, err)
+		}
 		// Really don't need this
 		a.analyzed = append(a.analyzed, path)
 	}
@@ -230,7 +233,7 @@ func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
 		}
 
 	case *dst.File:
-		// Detect if processed, if so, set flag and return false
+		// Detect if processed, if so, set the alreadyProcessed flag and return false
 		beforeDecs := nType.Decs.Start.All()
 		for _, s := range beforeDecs {
 			if s == PROCESSED_DIRECTIVE {
@@ -238,8 +241,21 @@ func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
 				return false
 			}
 		}
-		// Otherwise, set processed for next time
+		// Otherwise, set PROCESSED_DIRECTIVE for next time
 		nType.Decs.Start.Prepend(PROCESSED_DIRECTIVE)
+
+	case *dst.FuncDecl:
+		// Replace constructor now
+		if strings.HasPrefix(nType.Name.Name, "New") {
+			log.Printf("Found constructor: %+v", nType.Name.Name)
+			results := nType.Type.Results
+			// Only one result here; otherwise would be an error on preprocessing.
+			resType := results.List[0].Type
+			log.Printf("Result type: %+v", resType)
+			// resTypeKey := resType.(*dst.Ident).Name
+			nType.Name.Name = nType.Name.Name + "Orig"
+			c.Replace(nType)
+		}
 
 	case *dst.GenDecl:
 		// Add fx.Module declaration if needed, after imports
@@ -340,8 +356,10 @@ func (af *analyzedFile) inspect(n ast.Node) bool {
 			log.Printf("Found constructor: %+v", nType.Name.Name)
 			results := nType.Type.Results
 			if results.NumFields() != 1 {
-				log.Printf("Constructor %s has %d results, expected 1", nType.Name.Name, results.NumFields())
-				return true
+				errMsg := fmt.Sprintf("%s: Constructor %s has %d results, expected 1", af.relPath, nType.Name.Name, results.NumFields())
+				log.Println(errMsg)
+				af.err = errors.New(errMsg)
+				return false
 			}
 			resType := results.List[0].Type
 			log.Printf("Result type: %+v", resType)
@@ -350,8 +368,10 @@ func (af *analyzedFile) inspect(n ast.Node) bool {
 				af.constructors = make(map[string]*ast.FuncDecl)
 			}
 			if af.constructors[resTypeKey] != nil {
-				log.Printf("Constructor for %s already exists: %+v\n", resType, af.constructors[resTypeKey])
-				return true
+				errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.constructors[resTypeKey])
+				log.Println(errMsg)
+				af.err = errors.New(errMsg)
+				return false
 			}
 			af.constructors[resTypeKey] = nType
 			for i, param := range nType.Type.Params.List {
@@ -484,6 +504,9 @@ func (af *analyzedFile) prepareParamStructs() {
 
 // Return true if there were any changes to the file.
 func (af *analyzedFile) process() (bool, error) {
+	if af.err != nil {
+		return false, af.err
+	}
 
 	if af.constructors == nil || len(af.constructors) == 0 {
 		log.Printf("Skipping post-processing for %s -- no constructors\n", af.relPath)
@@ -502,7 +525,6 @@ func (af *analyzedFile) process() (bool, error) {
 	}
 
 	if af.err != nil {
-		log.Printf("Error in processing %s: %s\n", af.relPath, af.err)
 		return false, af.err
 	}
 
