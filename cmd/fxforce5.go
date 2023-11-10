@@ -23,6 +23,7 @@ import (
 func main() {
 	fmt.Println("Hello, World!")
 	srcRoot := "/Users/gregory/g/git/catalog-be-go2"
+	// TODO add as a pattern, to skip things like /generated/**.go
 	// ignores := []string{"internal/dependencies.go"}
 	analyzer := fxforce5.NewAnalyzer(srcRoot, nil)
 	analyzer.Analyze()

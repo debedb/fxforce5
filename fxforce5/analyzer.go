@@ -34,6 +34,9 @@ const (
 	// analyzed project (true) or from DIUTILS_IMPORT (false)
 	// TODO should be configurable on CLI
 	DIUTILS_LOCAL = true
+
+	// Processed directive to ignore a file
+	PROCESSED_DIRECTIVE = "// +fxforce5:processed"
 )
 
 // Analyzer uses various reflection/introspection/code analysis methods to analyze
@@ -146,8 +149,9 @@ func (a *Analyzer) walker(path string, info os.FileInfo, err error) error {
 		log.Printf("Error in walking %s: %s", path, err)
 		return err
 	}
-	if name == "vendor" {
-		log.Printf("Ignoring (vendor): %s", path)
+
+	if name == "vendor" || name == "generated" {
+		log.Printf("Ignoring path %s", path)
 		return filepath.SkipDir
 	}
 
@@ -227,7 +231,15 @@ func (af *analyzedFile) postProcessApplyPre(c *astutil.Cursor) bool {
 // No changes to the AST are made here.
 func (af *analyzedFile) inspect(n ast.Node) bool {
 	switch nType := n.(type) {
+
+	// TODO handle comments
+	case *ast.CommentGroup:
+		fmt.Printf("CommentGroup detected TODO")
+	case *ast.Comment:
+		fmt.Printf("Comment detected TODO")
+
 	case *ast.ImportSpec:
+		// Collect imports to add missing if needed
 		af.imports = append(af.imports, nType)
 
 	case *ast.TypeSpec:
@@ -405,15 +417,36 @@ func (af *analyzedFile) prepareParamStructs() {
 	}
 }
 
-func (af *analyzedFile) postProcess() {
+// Return true if there were any changes to the file.
+func (af *analyzedFile) process() bool {
+	alreadyProcessed := false
+	for _, c := range af.topNode.Comments {
+		for _, comment := range c.List {
+			if comment.Text == PROCESSED_DIRECTIVE {
+				alreadyProcessed = true
+				break
+			}
+		}
+	}
+
+	if alreadyProcessed {
+		log.Printf("Skipping post-processing for %s -- already processed\n", af.relPath)
+		return false
+	}
+
 	if af.constructors == nil || len(af.constructors) == 0 {
 		log.Printf("Skipping post-processing for %s -- no constructors\n", af.relPath)
-		return
+		return false
 	}
 	af.addImports()
 	af.prepareParamStructs()
 	astutil.Apply(af.topNode, af.postProcessApplyPre, af.postProcessApplyPost)
 
+	// Add processed directive
+	processedComment := &ast.Comment{Text: PROCESSED_DIRECTIVE}
+	af.topNode.Comments = append([]*ast.CommentGroup{{List: []*ast.Comment{processedComment}}},
+		af.topNode.Comments...)
+	return true
 }
 
 func (af *analyzedFile) write() error {
@@ -456,7 +489,10 @@ func (a *Analyzer) analyzeFile(path string) error {
 	// do any changes until we collect all the information. Then we use Apply to do the
 	// changes.
 	ast.Inspect(node, af.inspect)
-	af.postProcess()
+	if !af.process() {
+		log.Printf("No changes for %s\n", path)
+		return nil
+	}
 	err = af.write()
 	return err
 }
