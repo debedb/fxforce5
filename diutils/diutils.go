@@ -25,17 +25,24 @@ import (
 //		retval := utils.Construct[DependenciesParams, DependenciesType](params)
 //		return retval
 //	}
-func Construct[P any, T any, PT interface{ *T }](params interface{}) PT {
+func Construct[P any, T any, PT interface{ *T }](params P) PT {
 	p := PT(new(T))
 	construct0(params, p)
 	return p
 }
 
-func Constructx[P any, T any, PT interface{ *T }](params P) PT {
+// Similar to Construct() except that the return value is not a pointer.
+func ConstructVal[P any, T any, PT interface{ *T }](params P) T {
 	p := PT(new(T))
 	construct0(params, p)
-	return p
+	return *p
 }
+
+// func Construct[P any, T any, PT interface{ *T }](params interface{}) PT {
+// 	p := PT(new(T))
+// 	construct0(params, p)
+// 	return p
+// }
 
 func construct0(params interface{}, retval interface{}) {
 	// Check if retval is a pointer

@@ -5,7 +5,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Launch Package",
+            "name": "fxforce5",
             "type": "go",
             "request": "launch",
             "mode": "auto",
@@ -13,6 +13,14 @@
             "args": [
                 "/Users/gregory/g/git/catalog-be-go2"
             ]
+        },
+        {
+            "name": "Test Current File",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${file}",
+            "showLog": true
         }
     ]
 }

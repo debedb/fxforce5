@@ -6,11 +6,12 @@ import (
 	"go/types"
 	"strings"
 
+	"github.com/rs/zerolog/log"
+
 	"github.com/dave/dst"
 	"github.com/dave/dst/decorator"
 	"github.com/dave/dst/dstutil"
 	"golang.org/x/mod/modfile"
-	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 
 	// TODO make even this dynamic
@@ -23,7 +24,6 @@ import (
 	// "github.com/romana/core/common"
 
 	//	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 )
@@ -149,7 +149,7 @@ func (a *Analyzer) walker(path string, info os.FileInfo, err error) error {
 		return nil
 	}
 	if err != nil {
-		log.Printf("Error in walking %s: %s", path, err)
+		log.Error().Msgf("Error in walking %s: %s", path, err)
 		return err
 	}
 
@@ -161,7 +161,7 @@ func (a *Analyzer) walker(path string, info os.FileInfo, err error) error {
 	if strings.HasSuffix(name, ".go") {
 		err = a.analyzeFile(path)
 		if err != nil {
-			log.Printf("Error in analyzing %s: %s", path, err)
+			log.Error().Msgf("Error in analyzing %s: %s", path, err)
 		}
 		// Really don't need this
 		a.analyzed = append(a.analyzed, path)
@@ -211,11 +211,6 @@ type analyzedFile struct {
 
 	imports []*ast.ImportSpec
 }
-
-// Noop because we only use this in post-processing step anyway
-// func (af *analyzedFile) applyPost(c *astutil.Cursor) bool {
-// 	return true
-// }
 
 func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
 	n := c.Node()
@@ -353,39 +348,6 @@ func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
 	return true
 }
 
-// This is used to better structure changes in the post-processing step
-func (af *analyzedFile) applyPre(c *astutil.Cursor) bool {
-	n := c.Node()
-	switch nType := n.(type) {
-	case *ast.GenDecl:
-
-		// Add fx.Module declaration if needed, after imports
-		if nType.Tok == token.IMPORT {
-			if af.existingModuleVar != "" {
-				log.Printf("Skipping adding fx.Module declaration to %s -- already exists as %+v\n", af.relPath, af.existingModuleVar)
-				break
-			}
-			decl := af.getFxModuleDecl()
-			c.InsertAfter(decl)
-		}
-	// Add params struct
-	case *ast.TypeSpec:
-		if nType.Type.(*ast.StructType) == nil {
-			break
-		}
-		paramStructDecl := af.paramStruct[nType.Name.Name]
-		if paramStructDecl == nil {
-			log.Printf("No param struct for %s\n", nType.Name.Name)
-			break
-		}
-		log.Printf("Inserting %s after %s\n", paramStructDecl.Name.Name, nType.Name.Name)
-		// TODO this would group all the type decls together. It can be done separately
-		// similar to how it is done for the fx.Module declaration
-		c.InsertAfter(paramStructDecl)
-	}
-	return true
-}
-
 // First pass -- analyze the file and collect information about it.
 // No changes to the AST are made here.
 // TODO make it a pass also using dst
@@ -412,7 +374,6 @@ func (af *analyzedFile) inspect(n ast.Node) bool {
 			results := nType.Type.Results
 			if results.NumFields() != 1 {
 				errMsg := fmt.Sprintf("%s: Constructor %s has %d results, expected 1", af.relPath, nType.Name.Name, results.NumFields())
-				log.Println(errMsg)
 				af.err = errors.New(errMsg)
 				return false
 			}
@@ -424,7 +385,6 @@ func (af *analyzedFile) inspect(n ast.Node) bool {
 			}
 			if af.constructors[resTypeKey] != nil {
 				errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.constructors[resTypeKey])
-				log.Println(errMsg)
 				af.err = errors.New(errMsg)
 				return false
 			}
