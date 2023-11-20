@@ -176,21 +176,19 @@ type analyzedFile struct {
 
 	diutilsImportPath string
 
-	topNode *ast.File
-
-	topDstNode *dst.File
+	dstFile *dst.File
 
 	// Constructed in inspect()
-	structTypes []*ast.TypeSpec
+	structTypes []*dst.TypeSpec
 
 	// Map of identifier of return type to constructor function.
 	// Constructed in inspect()
-	constructors map[string]*ast.FuncDecl
+	constructors map[string]*dst.FuncDecl
 
 	// Map of identifier of struct types returned by constructors to
 	// the declarations of corresponding fx params structs
 	// Constructed in prepareParamStructs()
-	paramStruct map[string]*ast.TypeSpec
+	paramStruct map[string]*dst.TypeSpec
 
 	// If true, this file has already been processed.
 	// This will be detected by the presence of PROCESSED_DIRECTIVE.
@@ -208,11 +206,11 @@ type analyzedFile struct {
 	// Because walker (apply{Pre,Post} or Inspect) functions cannot return an error
 	// we'll store it here and return it after the walking.
 	err error
-
-	imports []*ast.ImportSpec
 }
 
-func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
+// Runs as a post-processing step after the first pass of dstutil.Apply()
+// as a applyPost function.
+func (af *analyzedFile) pass2Apply(c *dstutil.Cursor) bool {
 	n := c.Node()
 	switch nType := n.(type) {
 
@@ -259,7 +257,22 @@ func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
 
 			// TODO we could have already saved it from the original parse
 			// Plus we'll need to make distinction between pointer and non-pointer
-			origStructName := result.Type.(*dst.Ident).Name
+
+			var origStructName string
+			var valReturnType bool
+			switch result.Type.(type) {
+			case *dst.StarExpr:
+				origStructName = result.Type.(*dst.StarExpr).X.(*dst.Ident).Name
+				valReturnType = false
+			case *dst.Ident:
+				origStructName = result.Type.(*dst.Ident).Name
+				valReturnType = true
+			default:
+				errMsg := fmt.Sprintf("%s: Constructor %s has unexpected result type: %+v", af.relPath, nType.Name.Name, result.Type)
+				af.err = errors.New(errMsg)
+				return false
+			}
+
 			paramStructName := origStructName + "Params"
 
 			arg := &dst.Field{Names: []*dst.Ident{{Name: "params"}},
@@ -273,11 +286,16 @@ func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
 				&dst.Ident{Name: paramStructName},
 			}
 
+			diutilsFuncName := "Construct"
+			if valReturnType {
+				diutilsFuncName += "Val"
+			}
+
 			constructCall.Fun = &dst.IndexListExpr{
 				// diutils.Construct
 				X: &dst.SelectorExpr{
 					X:   &dst.Ident{Name: "diutils"},
-					Sel: &dst.Ident{Name: "Construct"},
+					Sel: &dst.Ident{Name: diutilsFuncName},
 				},
 				// Generic type parameters
 				Indices: constructGenericParams,
@@ -335,26 +353,24 @@ func (af *analyzedFile) applyPostDst(c *dstutil.Cursor) bool {
 			break
 		}
 		log.Printf("Inserting %s after %s\n", paramStructDecl.Name.Name, nType.Name.Name)
-		// TODO this would group all the type decls together. It can be done separately
-		// similar to how it is done for the fx.Module declaration
 
-		dstParamStructDecl, err := decorator.NewDecorator(nil).DecorateNode(paramStructDecl)
-		if err != nil {
-			af.err = err
-			return false
-		}
-		c.InsertAfter(dstParamStructDecl)
+		c.InsertAfter(paramStructDecl)
 	}
 	return true
+}
+
+func processConstructor(*dst.FuncDecl) (bool, error) {
+	return true, nil
 }
 
 // First pass -- analyze the file and collect information about it.
 // No changes to the AST are made here.
 // TODO make it a pass also using dst
-func (af *analyzedFile) inspect(n ast.Node) bool {
+func (af *analyzedFile) pass1Inspect(c *dstutil.Cursor) bool {
+	n := c.Node()
 	switch nType := n.(type) {
 
-	case *ast.ImportSpec:
+	case *dst.ImportSpec:
 		if nType.Path.Value == UBER_FX_IMPORT {
 			af.hasUberFxImport = true
 		}
@@ -362,13 +378,13 @@ func (af *analyzedFile) inspect(n ast.Node) bool {
 			af.hasDiUtilsImport = true
 		}
 
-	case *ast.TypeSpec:
-		if nType.Type.(*ast.StructType) != nil {
+	case *dst.TypeSpec:
+		if nType.Type.(*dst.StructType) != nil {
 			log.Printf("Found struct: %+v", nType.Name.Name)
 			af.structTypes = append(af.structTypes, nType)
 		}
 
-	case *ast.FuncDecl:
+	case *dst.FuncDecl:
 		if strings.HasPrefix(nType.Name.Name, "New") {
 			log.Printf("Found constructor: %+v", nType.Name.Name)
 			results := nType.Type.Results
@@ -379,9 +395,21 @@ func (af *analyzedFile) inspect(n ast.Node) bool {
 			}
 			resType := results.List[0].Type
 			log.Printf("Result type: %+v", resType)
-			resTypeKey := *&resType.(*ast.Ident).Name
+
+			var resTypeKey string
+			switch resType.(type) {
+			case *dst.StarExpr:
+				resTypeKey = *&resType.(*dst.StarExpr).X.(*dst.Ident).Name
+			case *dst.Ident:
+				resTypeKey = *&resType.(*dst.Ident).Name
+			default:
+				errMsg := fmt.Sprintf("%s: Constructor %s has unexpected result type: %+v", af.relPath, nType.Name.Name, resType)
+				af.err = errors.New(errMsg)
+				return false
+			}
+
 			if af.constructors == nil {
-				af.constructors = make(map[string]*ast.FuncDecl)
+				af.constructors = make(map[string]*dst.FuncDecl)
 			}
 			if af.constructors[resTypeKey] != nil {
 				errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.constructors[resTypeKey])
@@ -394,7 +422,7 @@ func (af *analyzedFile) inspect(n ast.Node) bool {
 			}
 		}
 
-	case *ast.GenDecl:
+	case *dst.GenDecl:
 		// Look for var declarations having fx.Module -- to skip calling
 		// addFxModule if so
 		if nType.Tok != token.VAR {
@@ -402,11 +430,11 @@ func (af *analyzedFile) inspect(n ast.Node) bool {
 		}
 		// This is a lot of nested ifs, sigh.
 		for _, spec := range nType.Specs {
-			if valSpec, ok := spec.(*ast.ValueSpec); ok {
+			if valSpec, ok := spec.(*dst.ValueSpec); ok {
 				for valSpecIdx, expr := range valSpec.Values {
-					if callExpr, ok := expr.(*ast.CallExpr); ok {
-						if selExpr, ok := callExpr.Fun.(*ast.SelectorExpr); ok {
-							if xExpr, ok := selExpr.X.(*ast.Ident); ok {
+					if callExpr, ok := expr.(*dst.CallExpr); ok {
+						if selExpr, ok := callExpr.Fun.(*dst.SelectorExpr); ok {
+							if xExpr, ok := selExpr.X.(*dst.Ident); ok {
 								if xExpr.Name == "fx" && selExpr.Sel.Name == "Module" {
 									af.existingModuleVar = valSpec.Names[valSpecIdx].Name
 									return true
@@ -478,7 +506,7 @@ func (af *analyzedFile) prepareParamStructs() {
 	if af.paramStruct == nil {
 		// TODO still use ast.TypeSpec because dst.TypeSpec has some issues,
 		// so for now it's a mix of ast and dst
-		af.paramStruct = make(map[string]*ast.TypeSpec)
+		af.paramStruct = make(map[string]*dst.TypeSpec)
 	}
 
 	for _, structType := range af.structTypes {
@@ -487,24 +515,24 @@ func (af *analyzedFile) prepareParamStructs() {
 			continue
 		}
 
-		paramStructFields := &ast.FieldList{
-			List: make([]*ast.Field, 0),
+		paramStructFields := &dst.FieldList{
+			List: make([]*dst.Field, 0),
 		}
 
 		// Add fx.In as first field
-		paramStructFields.List = append(paramStructFields.List, &ast.Field{
-			Type: &ast.Ident{Name: "fx.In"},
+		paramStructFields.List = append(paramStructFields.List, &dst.Field{
+			Type: &dst.Ident{Name: "fx.In"},
 		})
 
-		for _, field := range structType.Type.(*ast.StructType).Fields.List {
+		for _, field := range structType.Type.(*dst.StructType).Fields.List {
 			paramStructFields.List = append(paramStructFields.List, field)
 		}
 
-		paramStruct := &ast.StructType{
+		paramStruct := &dst.StructType{
 			Fields: paramStructFields,
 		}
-		paramTypeSpec := &ast.TypeSpec{
-			Name: &ast.Ident{Name: structType.Name.Name + "Params"},
+		paramTypeSpec := &dst.TypeSpec{
+			Name: &dst.Ident{Name: structType.Name.Name + "Params"},
 			Type: paramStruct,
 		}
 		// paramTypeDecl := &ast.GenDecl{
@@ -515,6 +543,12 @@ func (af *analyzedFile) prepareParamStructs() {
 		af.paramStruct[structType.Name.Name] = paramTypeSpec
 
 	}
+}
+
+// Pass 1 -- inspect the file and collect information about it.
+// Errors to be collected in af.err
+func (af *analyzedFile) doPass1() {
+	dstutil.Apply(af.dstFile, nil, af.pass1Inspect)
 }
 
 // Return true if there were any changes to the file.
@@ -530,8 +564,8 @@ func (af *analyzedFile) process() (bool, error) {
 
 	// astutil.Apply(af.topNode, af.applyPre, af.applyPost)
 	af.prepareParamStructs()
-	dstutil.Apply(af.topDstNode, nil, af.applyPostDst)
-
+	result := dstutil.Apply(af.dstFile, nil, af.pass2Apply)
+	af.dstFile = result.(*dst.File)
 	// This will only be detected in the post-processing step for now.
 	// When we replace inspect with dstUtil apply as first pass, this is to be moved up.
 	if af.alreadyProcessed {
@@ -558,7 +592,8 @@ func (af *analyzedFile) write() error {
 
 	// err = printer.Fprint(outFile, fset, af.topNode)
 	restorer := decorator.NewRestorer()
-	err = restorer.FileRestorer().Fprint(outFile, af.topDstNode)
+	fileRestorer := restorer.FileRestorer()
+	err = fileRestorer.Fprint(outFile, af.dstFile)
 
 	if err != nil {
 		return err
@@ -573,28 +608,28 @@ func (a *Analyzer) analyzeFile(path string) error {
 	fset := token.NewFileSet()
 	fmt.Printf("Analyzing %s\n", path)
 
-	node, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
-	if err != nil {
-		return err
-	}
-
-	dstNode, err := decorator.NewDecorator(nil).ParseFile(path, nil, parser.ParseComments)
-
+	// TODO make this dynamic -- we'll get it from the CLI flags
 	diutilsImportPath := DIUTILS_IMPORT
 	if DIUTILS_LOCAL {
 		diutilsImportPath = a.modPath + "/diutils"
 	}
+
+	dstFile, err := decorator.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		return err
+	}
+
 	af := &analyzedFile{
 		path:              path,
 		diutilsImportPath: diutilsImportPath,
 		relPath:           path[len(a.path+"/src/"):],
-		topNode:           node,
-		topDstNode:        dstNode}
+		dstFile:           dstFile}
 
-	// This is done in several passes. We use Inspect at the first pass because we cannot
-	// do any changes until we collect all the information. Then we use Apply to do the
-	// changes.
-	ast.Inspect(node, af.inspect)
+	// Pass 1.
+	// Inspect the file and collect information about it.
+	af.doPass1()
+
+	// Pass 2.
 	processed, err := af.process()
 	if err != nil {
 		return err
