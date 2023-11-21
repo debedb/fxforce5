@@ -351,7 +351,9 @@ func (af *analyzedFile) pass2Apply(c *dstutil.Cursor) bool {
 
 	// Add params struct
 	case *dst.TypeSpec:
-		if nType.Type.(*dst.StructType) == nil {
+		if _, ok := nType.Type.(*dst.StructType); !ok {
+			// TODO:
+			log.Printf("Skipping %s -- not a struct\n", nType.Name.Name)
 			break
 		}
 		origStructName := nType.Name.Name
@@ -387,9 +389,15 @@ func (af *analyzedFile) pass1Inspect(c *dstutil.Cursor) bool {
 		}
 
 	case *dst.TypeSpec:
-		if nType.Type.(*dst.StructType) != nil {
+		switch nType.Type.(type) {
+		case *dst.InterfaceType:
+			// Ignore for now https://github.com/debedb/fxforce5/issues/5
+			log.Printf("Found interface: %+v, ignoring for now", nType.Name.Name)
+			// af.structTypes = append(af.structTypes, nType)
+		case *dst.StructType:
 			log.Printf("Found struct: %+v", nType.Name.Name)
 			af.structTypes = append(af.structTypes, nType)
+
 		}
 
 	case *dst.FuncDecl:
@@ -648,7 +656,7 @@ func (af *analyzedFile) write() error {
 
 func (a *Analyzer) analyzeFile(path string) error {
 	fset := token.NewFileSet()
-	fmt.Printf("Analyzing %s\n", path)
+	log.Printf("Analyzing %s\n", path)
 
 	// TODO make this dynamic -- we'll get it from the CLI flags
 	diutilsImportPath := DIUTILS_IMPORT
