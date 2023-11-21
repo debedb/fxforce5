@@ -6,7 +6,9 @@ require (
 	golang.org/x/mod v0.13.0
 	golang.org/x/text v0.14.0
 	golang.org/x/tools v0.14.0
+)
 
+require (
 	github.com/dave/dst v0.27.3 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect

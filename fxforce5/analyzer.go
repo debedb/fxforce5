@@ -307,10 +307,18 @@ func (af *analyzedFile) pass2Apply(c *dstutil.Cursor) bool {
 				List: []dst.Stmt{retStmt},
 			}
 
-			ctorResults := &dst.FieldList{
-				List: []*dst.Field{
-					{Type: &dst.Ident{Name: origStructName}},
-				},
+			var ctorResults *dst.FieldList
+			if valReturnType {
+				ctorResults = &dst.FieldList{
+					List: []*dst.Field{
+						{Type: &dst.Ident{Name: origStructName}}},
+				}
+			} else {
+				ctorResults = &dst.FieldList{
+					List: []*dst.Field{
+						{Type: &dst.StarExpr{X: &dst.Ident{Name: origStructName}}},
+					},
+				}
 			}
 
 			newCtor := &dst.FuncDecl{
@@ -502,7 +510,7 @@ func (af *analyzedFile) getFxModuleDecl() *ast.GenDecl {
 // Fields have to be copied from the original struct, but fx.In has to be added
 // Unfortunately, merely embedding the original struct does not work.
 // See also https://github.com/uber-go/fx/discussions/1110
-func (af *analyzedFile) prepareParamStructs() {
+func (af *analyzedFile) prepareParamStructs() error {
 	if af.paramStruct == nil {
 		// TODO still use ast.TypeSpec because dst.TypeSpec has some issues,
 		// so for now it's a mix of ast and dst
@@ -524,8 +532,38 @@ func (af *analyzedFile) prepareParamStructs() {
 			Type: &dst.Ident{Name: "fx.In"},
 		})
 
+		// We want a deep copy, I think, because otherwise we'll end up with
+		// duplicated node error.
+		// But really?
+		// https://chat.openai.com/share/d5750874-6d05-4073-87f2-06387082a915
 		for _, field := range structType.Type.(*dst.StructType).Fields.List {
-			paramStructFields.List = append(paramStructFields.List, field)
+			// type Field struct {
+			// 	Names []*Ident  // field/method/(type) parameter names; or nil
+			// 	Type  Expr      // field/method/parameter type; or nil
+			// 	Tag   *BasicLit // field tag; or nil
+			// 	Decs  FieldDecorations
+			// }
+
+			newField := &dst.Field{}
+			switch fieldType := field.Type.(type) {
+			case *dst.StarExpr:
+				break
+			case *dst.SelectorExpr:
+				newField.Type = &dst.SelectorExpr{}
+				newField.Type.(*dst.SelectorExpr).X = &dst.Ident{Name: fieldType.X.(*dst.Ident).Name}
+				newField.Type.(*dst.SelectorExpr).Sel = &dst.Ident{Name: fieldType.Sel.Name}
+			case *dst.Ident:
+				newField.Type = &dst.Ident{Name: field.Type.(*dst.Ident).Name}
+			default:
+				log.Printf("Unexpected type for field %+v, ignoring for now", field.Type)
+			}
+
+			newField.Names = make([]*dst.Ident, 0)
+			for fieldName := range field.Names {
+				newField.Names = append(newField.Names, &dst.Ident{Name: field.Names[fieldName].Name})
+			}
+
+			paramStructFields.List = append(paramStructFields.List, newField)
 		}
 
 		paramStruct := &dst.StructType{
@@ -543,6 +581,7 @@ func (af *analyzedFile) prepareParamStructs() {
 		af.paramStruct[structType.Name.Name] = paramTypeSpec
 
 	}
+	return nil
 }
 
 // Pass 1 -- inspect the file and collect information about it.
@@ -563,7 +602,10 @@ func (af *analyzedFile) process() (bool, error) {
 	}
 
 	// astutil.Apply(af.topNode, af.applyPre, af.applyPost)
-	af.prepareParamStructs()
+	err := af.prepareParamStructs()
+	if err != nil {
+		return false, err
+	}
 	result := dstutil.Apply(af.dstFile, nil, af.pass2Apply)
 	af.dstFile = result.(*dst.File)
 	// This will only be detected in the post-processing step for now.
