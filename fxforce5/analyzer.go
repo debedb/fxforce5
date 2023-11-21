@@ -181,9 +181,13 @@ type analyzedFile struct {
 	// Constructed in inspect()
 	structTypes []*dst.TypeSpec
 
-	// Map of identifier of return type to constructor function.
-	// Constructed in inspect()
+	// Map of identifier of return type to constructor function
+	// for constructors returning structs.
 	constructors map[string]*dst.FuncDecl
+
+	// Map of identifier of return type to constructor function
+	// for constructors returning interfaces.
+	ifcConstructors map[string]*dst.FuncDecl
 
 	// Map of identifier of struct types returned by constructors to
 	// the declarations of corresponding fx params structs
@@ -226,15 +230,8 @@ func (af *analyzedFile) pass2Apply(c *dstutil.Cursor) bool {
 		}
 
 	case *dst.File:
-		// Detect if processed, if so, set the alreadyProcessed flag and return false
-		beforeDecs := nType.Decs.Start.All()
-		for _, s := range beforeDecs {
-			if s == PROCESSED_DIRECTIVE {
-				af.alreadyProcessed = true
-				return false
-			}
-		}
-		// Otherwise, set PROCESSED_DIRECTIVE for next time
+
+		// Set PROCESSED_DIRECTIVE for next time
 		nType.Decs.Start.Prepend(PROCESSED_DIRECTIVE)
 
 	case *dst.ValueSpec:
@@ -244,7 +241,17 @@ func (af *analyzedFile) pass2Apply(c *dstutil.Cursor) bool {
 		// Replace constructor now
 		if strings.HasPrefix(nType.Name.Name, "New") {
 			ctorName := nType.Name.Name
+			ctorType := strings.TrimPrefix(ctorName, "New")
 			log.Printf("Found constructor: %+v", ctorName)
+			if af.constructors[ctorType] == nil {
+				if af.ifcConstructors[ctorType] == nil {
+					log.Printf("Skipping %s -- not in list of constructors", ctorName)
+					return false
+				} else {
+					log.Printf("Skipping %s -- it's an interface constructor", ctorName)
+					return false
+				}
+			}
 
 			// Rename original one
 
@@ -401,6 +408,7 @@ func (af *analyzedFile) pass1Inspect(c *dstutil.Cursor) bool {
 		}
 
 	case *dst.FuncDecl:
+		// TODO this is too big, refactor
 		if strings.HasPrefix(nType.Name.Name, "New") {
 			log.Printf("Found constructor: %+v", nType.Name.Name)
 			results := nType.Type.Results
@@ -412,29 +420,72 @@ func (af *analyzedFile) pass1Inspect(c *dstutil.Cursor) bool {
 			resType := results.List[0].Type
 			log.Printf("Result type: %+v", resType)
 
+			var isStruct bool
+			// Identifier of the result type (name of struct or interface)
+			// Not to be confused with kind (WHETHER it is a a struct or interface)
+			// TODO: is it even correct terminology?
 			var resTypeKey string
 			switch resType.(type) {
 			case *dst.StarExpr:
 				resTypeKey = *&resType.(*dst.StarExpr).X.(*dst.Ident).Name
+				// TODO handle ptr to ifc
 			case *dst.Ident:
-				resTypeKey = *&resType.(*dst.Ident).Name
+				ident := *resType.(*dst.Ident)
+				resTypeKey = ident.Name
+				resKindDecl := ident.Obj.Decl
+
+				// We want to see the kind of the result type: interface or struct
+				// We're ignoring all other types for now.
+				switch spec := resKindDecl.(type) {
+				case *dst.TypeSpec:
+					resTypeType := spec.Type
+					switch resTypeType.(type) {
+					case *dst.InterfaceType:
+						isStruct = false
+					case *dst.StructType:
+						isStruct = true
+					default:
+						log.Printf("Ignoring result type of %s: %+v for now", nType.Name.Name, resTypeType)
+						return false
+					}
+				default:
+					log.Printf("Ignoring result type of %s: %+v for now", nType.Name.Name, resKindDecl)
+					return false
+				}
+
 			default:
 				errMsg := fmt.Sprintf("%s: Constructor %s has unexpected result type: %+v", af.relPath, nType.Name.Name, resType)
 				af.err = errors.New(errMsg)
 				return false
 			}
 
-			if af.constructors == nil {
-				af.constructors = make(map[string]*dst.FuncDecl)
-			}
-			if af.constructors[resTypeKey] != nil {
-				errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.constructors[resTypeKey])
-				af.err = errors.New(errMsg)
-				return false
-			}
-			af.constructors[resTypeKey] = nType
-			for i, param := range nType.Type.Params.List {
-				log.Printf("\tParam %d: %+v", i, param)
+			if isStruct {
+				if af.constructors == nil {
+					af.constructors = make(map[string]*dst.FuncDecl)
+				}
+				if af.constructors[resTypeKey] != nil {
+					errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.constructors[resTypeKey])
+					af.err = errors.New(errMsg)
+					return false
+				}
+				af.constructors[resTypeKey] = nType
+				for i, param := range nType.Type.Params.List {
+					log.Printf("\tParam %d: %+v", i, param)
+				}
+			} else {
+				if af.ifcConstructors == nil {
+					af.ifcConstructors = make(map[string]*dst.FuncDecl)
+				}
+
+				if af.ifcConstructors[resTypeKey] != nil {
+					errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.ifcConstructors[resTypeKey])
+					af.err = errors.New(errMsg)
+					return false
+				}
+				af.ifcConstructors[resTypeKey] = nType
+				for i, param := range nType.Type.Params.List {
+					log.Printf("\tParam %d: %+v", i, param)
+				}
 			}
 		}
 
@@ -667,6 +718,15 @@ func (a *Analyzer) analyzeFile(path string) error {
 	dstFile, err := decorator.ParseFile(fset, path, nil, parser.ParseComments)
 	if err != nil {
 		return err
+	}
+
+	// Check if we already processed this file
+	beforeDecs := dstFile.Decs.Start.All()
+	for _, s := range beforeDecs {
+		if s == PROCESSED_DIRECTIVE {
+			log.Printf("Skipping %s -- already processed\n", path)
+			return nil
+		}
 	}
 
 	af := &analyzedFile{
