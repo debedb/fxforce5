@@ -641,7 +641,7 @@ func (af *analyzedFile) write() error {
 		return err
 	}
 	outFile.Close()
-	fmt.Printf("Wrote %s\n", newPath)
+	log.Printf("Wrote %s\n", newPath)
 
 	return nil
 }
