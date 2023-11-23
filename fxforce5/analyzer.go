@@ -182,25 +182,13 @@ type analyzedFile struct {
 	structTypes []*dst.TypeSpec
 
 	// Map of identifier of return type to constructor function
-	// for constructors returning structs.
-	constructors map[string]*dst.FuncDecl
-
-	// Map of identifier of return type to constructor function
-	// for constructors returning interfaces.
-	ifcConstructors map[string]*dst.FuncDecl
+	// information
+	ctors map[string]*ctorInfo
 
 	// Map of identifier of struct types returned by constructors to
 	// the declarations of corresponding fx params structs
 	// Constructed in prepareParamStructs()
 	paramStruct map[string]*dst.TypeSpec
-
-	// If true, this file has already been processed.
-	// This will be detected by the presence of PROCESSED_DIRECTIVE.
-	// This is detected by applyPreDst() (not by inspect() which detects
-	// everything in the first pass because for some reason the ast handling
-	// of comments even on read is flaky. We want to detect this directive
-	// in the top of the file.
-	alreadyProcessed bool
 
 	hasUberFxImport  bool
 	hasDiUtilsImport bool
@@ -243,14 +231,14 @@ func (af *analyzedFile) pass2Apply(c *dstutil.Cursor) bool {
 			ctorName := nType.Name.Name
 			ctorType := strings.TrimPrefix(ctorName, "New")
 			log.Printf("Found constructor: %+v", ctorName)
-			if af.constructors[ctorType] == nil {
-				if af.ifcConstructors[ctorType] == nil {
-					log.Printf("Skipping %s -- not in list of constructors", ctorName)
-					return false
-				} else {
-					log.Printf("Skipping %s -- it's an interface constructor", ctorName)
-					return false
-				}
+			ctorInfo := af.ctors[ctorType]
+			if ctorInfo == nil {
+				log.Printf("Skipping %s -- not in list of constructors", ctorName)
+				return false
+			}
+			if ctorInfo.returnInfo.returnKind == interfaceKind {
+				log.Printf("Skipping %s -- it's an interface constructor", ctorName)
+				return false
 			}
 
 			// Rename original one
@@ -376,8 +364,123 @@ func (af *analyzedFile) pass2Apply(c *dstutil.Cursor) bool {
 	return true
 }
 
-func processConstructor(*dst.FuncDecl) (bool, error) {
-	return true, nil
+type returnKind int
+
+// Declare related constants for each weekday starting with index 1
+const (
+	structKind returnKind = iota + 1
+	interfaceKind
+)
+
+type returnInfo struct {
+	// Name of the return type
+	name       string
+	ptr        bool
+	returnKind returnKind
+}
+
+type ctorInfo struct {
+	returnInfo *returnInfo
+	decl       *dst.FuncDecl
+}
+
+// Get information about return object of a constructor.
+// Returns name of the return type and whether it's a value or pointer.
+func (af *analyzedFile) getReturnInfo(expr dst.Expr) *returnInfo {
+	retInfo := &returnInfo{ptr: false}
+
+	switch e := expr.(type) {
+	case *dst.StarExpr:
+		retInfo.ptr = true
+		retInfo.name = e.X.(*dst.Ident).Name
+		log.Printf("%s\n", e.X.(*dst.Ident).Obj.Kind)
+		retInfo.returnKind = structKind
+		// TODO handle ptr to ifc
+	case *dst.Ident:
+		retInfo.name = e.Name
+		resKindDecl := e.Obj.Decl
+
+		// We want to see the kind of the result type: interface or struct
+		// We're ignoring all other types for now.
+		switch spec := resKindDecl.(type) {
+		case *dst.TypeSpec:
+			resTypeType := spec.Type
+			switch resTypeType.(type) {
+			case *dst.InterfaceType:
+				retInfo.returnKind = interfaceKind
+			case *dst.StructType:
+				retInfo.returnKind = structKind
+			default:
+				errMsg := fmt.Sprintf("Unexpected type for result type: %+v", resTypeType)
+				panic(errMsg)
+			}
+		default:
+			// TODO
+			errMsg := fmt.Sprintf("%s: Constructor %s has unexpected result type: %+v", af.relPath, nType.Name.Name, resType)
+			panic(errMsg)
+		}
+
+	default:
+		errMsg := fmt.Sprintf("%s: Constructor %s has unexpected result type: %+v", af.relPath, nType.Name.Name, resType)
+		// TODO
+		panic(errMsg)
+	}
+}
+
+func (af *analyzedFile) inspectConstructor(nType *dst.FuncDecl) bool {
+	if af.ctors == nil {
+		af.ctors = make(map[string]*ctorInfo)
+	}
+	ctorInfo := &ctorInfo{decl: nType}
+	// TODO this is too big, refactor
+	if strings.HasPrefix(nType.Name.Name, "New") {
+		log.Printf("Found constructor: %+v", nType.Name.Name)
+		results := nType.Type.Results
+		if results.NumFields() != 1 {
+			errMsg := fmt.Sprintf("%s: Constructor %s has %d results, expected 1", af.relPath, nType.Name.Name, results.NumFields())
+			af.err = errors.New(errMsg)
+			return false
+		}
+		resType := results.List[0].Type
+		log.Printf("Result type: %+v", resType)
+
+		// Identifier of the result type (name of struct or interface)
+		// Not to be confused with kind (WHETHER it is a a struct or interface)
+		// TODO: is it even correct terminology?
+		var resTypeKey string
+
+		returnInfo := af.getReturnInfo(resType)
+
+		if returnInfo.returnKind == structKind {
+			if af.constructors == nil {
+				af.constructors = make(map[string]*dst.FuncDecl)
+			}
+			if af.constructors[resTypeKey] != nil {
+				errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.constructors[resTypeKey])
+				af.err = errors.New(errMsg)
+				return false
+			}
+			af.constructors[resTypeKey] = nType
+			for i, param := range nType.Type.Params.List {
+				log.Printf("\tParam %d: %+v", i, param)
+			}
+		} else {
+			if af.ifcConstructors == nil {
+				af.ifcConstructors = make(map[string]*dst.FuncDecl)
+			}
+
+			if af.ifcConstructors[resTypeKey] != nil {
+				errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.ifcConstructors[resTypeKey])
+				af.err = errors.New(errMsg)
+				return false
+			}
+			af.ifcConstructors[resTypeKey] = nType
+			for i, param := range nType.Type.Params.List {
+				log.Printf("\tParam %d: %+v", i, param)
+			}
+		}
+	}
+	return true
 }
 
 // First pass -- analyze the file and collect information about it.
@@ -408,86 +511,8 @@ func (af *analyzedFile) pass1Inspect(c *dstutil.Cursor) bool {
 		}
 
 	case *dst.FuncDecl:
-		// TODO this is too big, refactor
-		if strings.HasPrefix(nType.Name.Name, "New") {
-			log.Printf("Found constructor: %+v", nType.Name.Name)
-			results := nType.Type.Results
-			if results.NumFields() != 1 {
-				errMsg := fmt.Sprintf("%s: Constructor %s has %d results, expected 1", af.relPath, nType.Name.Name, results.NumFields())
-				af.err = errors.New(errMsg)
-				return false
-			}
-			resType := results.List[0].Type
-			log.Printf("Result type: %+v", resType)
-
-			var isStruct bool
-			// Identifier of the result type (name of struct or interface)
-			// Not to be confused with kind (WHETHER it is a a struct or interface)
-			// TODO: is it even correct terminology?
-			var resTypeKey string
-			switch resType.(type) {
-			case *dst.StarExpr:
-				resTypeKey = *&resType.(*dst.StarExpr).X.(*dst.Ident).Name
-				// TODO handle ptr to ifc
-			case *dst.Ident:
-				ident := *resType.(*dst.Ident)
-				resTypeKey = ident.Name
-				resKindDecl := ident.Obj.Decl
-
-				// We want to see the kind of the result type: interface or struct
-				// We're ignoring all other types for now.
-				switch spec := resKindDecl.(type) {
-				case *dst.TypeSpec:
-					resTypeType := spec.Type
-					switch resTypeType.(type) {
-					case *dst.InterfaceType:
-						isStruct = false
-					case *dst.StructType:
-						isStruct = true
-					default:
-						log.Printf("Ignoring result type of %s: %+v for now", nType.Name.Name, resTypeType)
-						return false
-					}
-				default:
-					log.Printf("Ignoring result type of %s: %+v for now", nType.Name.Name, resKindDecl)
-					return false
-				}
-
-			default:
-				errMsg := fmt.Sprintf("%s: Constructor %s has unexpected result type: %+v", af.relPath, nType.Name.Name, resType)
-				af.err = errors.New(errMsg)
-				return false
-			}
-
-			if isStruct {
-				if af.constructors == nil {
-					af.constructors = make(map[string]*dst.FuncDecl)
-				}
-				if af.constructors[resTypeKey] != nil {
-					errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.constructors[resTypeKey])
-					af.err = errors.New(errMsg)
-					return false
-				}
-				af.constructors[resTypeKey] = nType
-				for i, param := range nType.Type.Params.List {
-					log.Printf("\tParam %d: %+v", i, param)
-				}
-			} else {
-				if af.ifcConstructors == nil {
-					af.ifcConstructors = make(map[string]*dst.FuncDecl)
-				}
-
-				if af.ifcConstructors[resTypeKey] != nil {
-					errMsg := fmt.Sprintf("%s: Constructor for %s already exists: %+v", af.relPath, resTypeKey, af.ifcConstructors[resTypeKey])
-					af.err = errors.New(errMsg)
-					return false
-				}
-				af.ifcConstructors[resTypeKey] = nType
-				for i, param := range nType.Type.Params.List {
-					log.Printf("\tParam %d: %+v", i, param)
-				}
-			}
-		}
+		ok := af.inspectConstructor(nType)
+		return ok
 
 	case *dst.GenDecl:
 		// Look for var declarations having fx.Module -- to skip calling
@@ -667,12 +692,6 @@ func (af *analyzedFile) process() (bool, error) {
 	}
 	result := dstutil.Apply(af.dstFile, nil, af.pass2Apply)
 	af.dstFile = result.(*dst.File)
-	// This will only be detected in the post-processing step for now.
-	// When we replace inspect with dstUtil apply as first pass, this is to be moved up.
-	if af.alreadyProcessed {
-		log.Printf("Skipping post-processing for %s -- already processed\n", af.relPath)
-		return false, nil
-	}
 
 	if af.err != nil {
 		return false, af.err
